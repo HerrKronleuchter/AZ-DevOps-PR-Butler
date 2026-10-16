@@ -1,0 +1,10 @@
+{
+  "name": "PR-Butler",
+  "description": "I show you your PRs in System tray",
+  "uuid": "PR-Butler@kronleuchter",
+  "shell-version": [
+    "50"
+  ],
+  "version": "0.0.1",
+  "settings-schema": "org.gnome.shell.extensions.pr-butler"
+}
