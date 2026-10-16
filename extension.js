@@ -10,6 +10,7 @@ import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 
 const API_VERSION = '7.1';
+const AZURE_ORIGIN = 'https://dev.azure.com';
 
 export default class PRButlerExtension extends Extension {
     enable() {
@@ -74,7 +75,37 @@ export default class PRButlerExtension extends Extension {
         });
     }
 
+    _escapePathSegment(segment) {
+        const text = String(segment);
+        if (!text.trim())
+            throw new Error('Azure DevOps path segment must not be empty');
+        if (/[\/\u0000-\u001f\u007f]/.test(text))
+            throw new Error(`Invalid Azure DevOps path segment: ${text}`);
+
+        return encodeURIComponent(text);
+    }
+
+    _buildAzureUrl(pathSegments, queryParams = {}) {
+        const url = new URL(AZURE_ORIGIN);
+        url.pathname = `/${pathSegments.map(segment => this._escapePathSegment(segment)).join('/')}`;
+
+        for (const [key, value] of Object.entries(queryParams)) {
+            if (value !== undefined && value !== null)
+                url.searchParams.set(key, String(value));
+        }
+
+        return url.toString();
+    }
+
+    _assertAzureUrl(url) {
+        const parsedUrl = new URL(url);
+        if (parsedUrl.protocol !== 'https:' || parsedUrl.hostname !== 'dev.azure.com')
+            throw new Error(`Blocked non-Azure URL: ${url}`);
+    }
+
     _sendJson(url, pat) {
+        this._assertAzureUrl(url);
+
         return new Promise((resolve, reject) => {
             const message = Soup.Message.new('GET', url);
             if (pat)
@@ -98,34 +129,50 @@ export default class PRButlerExtension extends Extension {
     }
 
     async _fetchPullRequests() {
-        const org = this._settings.get_string('azure-org');
+        const org = this._settings.get_string('azure-org').trim();
         const pat = this._settings.get_string('azure-pat');
 
         if (!org || !pat)
             throw new Error('Azure DevOps organization or PAT not configured');
 
-        const base = `https://dev.azure.com/${org}`;
         const connection = await this._sendJson(
-            `${base}/_apis/connectionData?connectOptions=1&lastChangeId=-1&lastChangeId64=-1&api-version=7.1-preview.1`, pat
+            this._buildAzureUrl(
+                [org, '_apis', 'connectionData'],
+                {
+                    connectOptions: 1,
+                    lastChangeId: -1,
+                    lastChangeId64: -1,
+                    'api-version': '7.1-preview.1',
+                }
+            ),
+            pat
         );
         const currentUserId = connection.authenticatedUser?.id;
         if (!currentUserId)
             throw new Error('Could not determine the authenticated Azure DevOps user');
 
-        const projects = (await this._sendJson(`${base}/_apis/projects?api-version=${API_VERSION}`, pat)).value ?? [];
+        const projects = (await this._sendJson(
+            this._buildAzureUrl([org, '_apis', 'projects'], {'api-version': API_VERSION}),
+            pat
+        )).value ?? [];
 
         const prs = [];
 
         await Promise.all(projects.map(async project => {
+            const projectName = project.name ?? '';
             const repos = (await this._sendJson(
-                `${base}/${project.name}/_apis/git/repositories?api-version=${API_VERSION}`, pat
+                this._buildAzureUrl([org, projectName, '_apis', 'git', 'repositories'], {'api-version': API_VERSION}),
+                pat
             )).value ?? [];
 
             await Promise.all(repos.map(async repo => {
                 try {
                     const repoPrs = (await this._sendJson(
-                        `${base}/${project.name}/_apis/git/repositories/${repo.id}/pullrequests` +
-                        `?searchCriteria.status=active&api-version=${API_VERSION}`, pat
+                        this._buildAzureUrl(
+                            [org, projectName, '_apis', 'git', 'repositories', repo.id, 'pullrequests'],
+                            {'searchCriteria.status': 'active', 'api-version': API_VERSION}
+                        ),
+                        pat
                     )).value ?? [];
 
                     for (const pr of repoPrs) {
@@ -141,7 +188,9 @@ export default class PRButlerExtension extends Extension {
                                 isAuthor: isCreatedByUser,
                                 isReviewer: isAssignedToUser,
                                 reviewers: pr.reviewers ?? [],
-                                url: `https://dev.azure.com/${org}/${project.name}/_git/${repo.name}/pullrequest/${pr.pullRequestId}`,
+                                url: this._buildAzureUrl(
+                                    [org, projectName, '_git', repo.name, 'pullrequest', pr.pullRequestId]
+                                ),
                             });
                         }
                     }
@@ -206,6 +255,7 @@ export default class PRButlerExtension extends Extension {
                 `#${pr.id} ${pr.project}/${pr.repo} — ${pr.title}`
             );
             item.connect('activate', () => {
+                this._assertAzureUrl(pr.url);
                 Gio.AppInfo.launch_default_for_uri(pr.url, null);
             });
             this._indicator.menu.addMenuItem(item);
